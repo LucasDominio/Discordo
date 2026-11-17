@@ -27,6 +27,17 @@
         .btn-slate { @apply bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700/80; }
         .tab { @apply px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 text-slate-400 hover:text-slate-200; }
         .tab-active { @apply bg-indigo-600 text-white hover:text-white; }
+
+        /* Grade de telas compartilhadas (1 a 6 simultâneas) */
+        .screens-grid { display: grid; gap: .75rem; width: 100%; height: 100%; grid-template-columns: 1fr; grid-auto-rows: minmax(0, 1fr); }
+        .screens-grid[data-count="3"], .screens-grid[data-count="4"],
+        .screens-grid[data-count="5"], .screens-grid[data-count="6"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .screens-grid[data-count="3"] .screen-tile:last-child { grid-column: span 2; }
+        @media (min-width: 1024px) {
+            .screens-grid[data-count="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .screens-grid[data-count="5"], .screens-grid[data-count="6"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
+        .tile-btn { @apply w-9 h-9 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-700/80 text-slate-200 flex items-center justify-center transition-all shadow-lg backdrop-blur; }
     </style>
 </head>
 <body class="h-dvh bg-slate-950 text-slate-100 flex flex-col overflow-hidden">
@@ -114,20 +125,11 @@
                     </div>
                     <div class="space-y-1.5">
                         <h3 class="text-base font-semibold text-slate-200">Nenhum compartilhamento de tela ativo</h3>
-                        <p class="text-xs text-slate-400 leading-relaxed">O áudio por voz está ativo. Compartilhe a tela do seu PC para transmitir para todos na sala.</p>
+                        <p class="text-xs text-slate-400 leading-relaxed">O áudio por voz está ativo. Qualquer pessoa pode compartilhar a tela e várias telas podem ser exibidas ao mesmo tempo.</p>
                     </div>
                 </div>
 
-                <video id="shared-video" autoplay playsinline class="max-h-full max-w-full object-contain rounded-2xl shadow-2xl border border-slate-800 hidden"></video>
-
-                <div id="presenter-badge" class="absolute top-6 left-6 bg-slate-900/90 border border-slate-700/80 px-3 py-1.5 rounded-xl flex items-center gap-2 text-xs font-medium text-slate-200 shadow-lg backdrop-blur hidden z-10">
-                    <i class="fa-solid fa-circle text-[8px] text-rose-500 animate-pulse motion-reduce:animate-none" aria-hidden="true"></i>
-                    <span id="presenter-name">Transmitindo tela</span>
-                </div>
-
-                <button id="fullscreen-btn" aria-label="Tela cheia" class="absolute bottom-6 right-6 bg-slate-900/80 hover:bg-slate-800 border border-slate-700/80 text-slate-200 p-2.5 rounded-xl transition-all shadow-lg backdrop-blur hidden z-10">
-                    <i id="fullscreen-icon" class="fa-solid fa-expand text-sm" aria-hidden="true"></i>
-                </button>
+                <div id="screens-grid" class="screens-grid hidden" data-count="0"></div>
             </div>
 
             <div class="h-20 bg-slate-900/80 border-t border-slate-800/80 px-3 sm:px-6 flex items-center justify-between z-20 shrink-0">
@@ -230,13 +232,14 @@
     let registry = null;        // Peer "recepção" da sala (id fixo). Quem o possui é o anfitrião.
     let myUsername = '', roomId = '', myPeerId = '', hostPeerId = '';
     let isHost = false, connected = false, micOn = false, isSharing = false;
-    let presenterId = null;     // null | 'self' | peerId
     let localAudioStream = null, localDisplayStream = null, audioCtx = null, silentStream = null;
     let wantHistory = null, historyAsked = false, lobbyRetry = null, toastTimer = null, reconnectTries = 0;
 
     const peerConnections = new Map(); // peerId -> { conn, outgoing, username, micActive, isHost, greeted }
     const voiceCalls = new Map();      // peerId -> MediaConnection (voz)
-    const screenCalls = new Map();     // peerId -> MediaConnection (tela)
+    const screenIn = new Map();        // peerId -> MediaConnection (tela que RECEBO deste participante)
+    const screenOut = new Map();       // peerId -> MediaConnection (minha tela que ENVIO a este participante)
+    const screenTiles = new Map();     // 'self' | peerId -> { el, video, label, stream, popup }
     const speakers = new Map();        // id -> { an, buf, on }
     const chatHistory = [];
 
@@ -249,9 +252,7 @@
     const loginStatus = $('login-status'), loginStatusIcon = $('login-status-icon'), loginStatusText = $('login-status-text'), enterBtn = $('enter-btn');
     const appContainer = $('app-container'), currentRoomLabel = $('current-room-label'), roleBadge = $('role-badge');
     const statusPill = $('connection-status-pill'), statusDot = $('status-dot'), statusPing = $('status-ping');
-    const stageContainer = $('stage-container'), videoPlaceholder = $('video-placeholder'), sharedVideo = $('shared-video');
-    const presenterBadge = $('presenter-badge'), presenterName = $('presenter-name');
-    const fullscreenBtn = $('fullscreen-btn'), fullscreenIcon = $('fullscreen-icon');
+    const videoPlaceholder = $('video-placeholder'), screensGrid = $('screens-grid');
     const toggleMicBtn = $('toggle-mic-btn'), micIcon = $('mic-icon'), micBtnText = $('mic-btn-text');
     const shareScreenBtn = $('share-screen-btn'), shareBtnText = $('share-btn-text');
     const copyLinkBtn = $('copy-link-btn'), leaveBtn = $('leave-btn');
@@ -409,9 +410,13 @@
                 bindDataConnection(conn, false);
             });
             peer.on('call', (call) => {
-                const kind = call.metadata?.kind === 'screen' ? 'screen' : 'voice';
-                call.answer(kind === 'voice' ? outgoingAudio() : undefined);
-                bindMediaCall(call, kind);
+                if (call.metadata?.kind === 'screen') {
+                    call.answer(); // só recebe; não devolve mídia
+                    bindMediaCall(call, 'screen-in');
+                } else {
+                    call.answer(outgoingAudio());
+                    bindMediaCall(call, 'voice');
+                }
             });
         });
     }
@@ -572,10 +577,11 @@
         peerConnections.delete(id);
         try { info.conn.close(); } catch (_) {}
         const vc = voiceCalls.get(id); voiceCalls.delete(id); vc?.close();
-        const sc = screenCalls.get(id); screenCalls.delete(id); sc?.close();
+        const si = screenIn.get(id); screenIn.delete(id); si?.close();
+        const so = screenOut.get(id); screenOut.delete(id); so?.close();
         removeAudio(id);
         unwatch(id);
-        if (presenterId === id) clearStage();
+        removeScreenTile(id);
         if (info.greeted) {
             appendSystemMsg(`${info.username} saiu da sala.`);
             showToast(`${info.username} saiu.`);
@@ -598,10 +604,6 @@
                     appendSystemMsg(`${info.username} entrou na sala.`);
                     showToast(`${info.username} conectou-se!`);
                 }
-                if (data.sharing === true && presenterId === null) {
-                    presenterName.textContent = `${info.username} está transmitindo`;
-                    presenterBadge.classList.remove('hidden');
-                }
                 if (wantHistory === conn.peer) {
                     wantHistory = null;
                     historyAsked = true;
@@ -622,11 +624,9 @@
             case 'screen-state':
                 if (data.active === true) {
                     appendSystemMsg(`${info.username} iniciou compartilhamento de tela.`);
-                    presenterName.textContent = `${info.username} está transmitindo`;
-                    presenterBadge.classList.remove('hidden');
                 } else {
                     appendSystemMsg(`${info.username} encerrou a transmissão.`);
-                    if (presenterId === conn.peer) clearStage(); else if (presenterId === null) presenterBadge.classList.add('hidden');
+                    removeScreenTile(conn.peer);
                 }
                 break;
             case 'host-changed':
@@ -661,23 +661,26 @@
 
     // ============================================================
     // CHAMADAS DE MÍDIA (VOZ E TELA)
+    // kind: 'voice' | 'screen-in' (recebo) | 'screen-out' (envio)
+    // Telas usam mapas separados para vários participantes poderem
+    // compartilhar ao mesmo tempo sem uma chamada sobrescrever a outra.
     // ============================================================
     function bindMediaCall(call, kind) {
         if (!call) return;
-        const map = kind === 'screen' ? screenCalls : voiceCalls;
+        const map = kind === 'screen-in' ? screenIn : kind === 'screen-out' ? screenOut : voiceCalls;
         const old = map.get(call.peer);
         map.set(call.peer, call);
         if (old && old !== call) old.close();
 
         call.on('stream', (stream) => {
-            if (kind === 'screen') showRemoteScreen(call.peer, stream);
-            else { playRemoteAudio(call.peer, stream); watchSpeaking(call.peer, stream); }
+            if (kind === 'screen-in') addScreenTile(call.peer, stream);
+            else if (kind === 'voice') { playRemoteAudio(call.peer, stream); watchSpeaking(call.peer, stream); }
         });
         const ended = () => {
             if (map.get(call.peer) !== call) return; // foi substituída
             map.delete(call.peer);
-            if (kind === 'screen') { if (presenterId === call.peer) clearStage(); }
-            else { removeAudio(call.peer); unwatch(call.peer); }
+            if (kind === 'screen-in') removeScreenTile(call.peer);
+            else if (kind === 'voice') { removeAudio(call.peer); unwatch(call.peer); }
         };
         call.on('close', ended);
         call.on('error', ended);
@@ -759,41 +762,132 @@
     }, 150);
 
     // ============================================================
-    // COMPARTILHAMENTO DE TELA
+    // COMPARTILHAMENTO DE TELA (VÁRIOS AO MESMO TEMPO)
     // ============================================================
     function callScreen(id) {
         if (!localDisplayStream || !peer) return;
-        bindMediaCall(peer.call(id, localDisplayStream, { metadata: { kind: 'screen' } }), 'screen');
+        bindMediaCall(peer.call(id, localDisplayStream, { metadata: { kind: 'screen' } }), 'screen-out');
     }
 
-    function showRemoteScreen(peerId, stream) {
-        presenterId = peerId;
-        sharedVideo.muted = false;
-        sharedVideo.srcObject = stream;
-        sharedVideo.classList.remove('hidden');
-        videoPlaceholder.classList.add('hidden');
-        fullscreenBtn.classList.remove('hidden');
-        const name = peerConnections.get(peerId)?.username;
-        if (name) presenterName.textContent = `${name} está transmitindo`;
-        presenterBadge.classList.remove('hidden');
-        sharedVideo.play().catch(() => showToast('Toque no vídeo para ativar o áudio da transmissão.'));
+    function tileTitle(id) {
+        if (id === 'self') return 'Você está transmitindo';
+        return `${peerConnections.get(id)?.username || 'Participante'} está transmitindo`;
     }
 
-    function clearStage() {
-        presenterId = null;
-        sharedVideo.srcObject = null;
-        sharedVideo.classList.add('hidden');
-        videoPlaceholder.classList.remove('hidden');
-        fullscreenBtn.classList.add('hidden');
-        presenterBadge.classList.add('hidden');
+    function tileButton(icon, label, onClick) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tile-btn';
+        b.setAttribute('aria-label', label);
+        b.title = label;
+        b.innerHTML = `<i class="fa-solid ${icon} text-sm" aria-hidden="true"></i>`;
+        b.addEventListener('click', onClick);
+        return b;
     }
+
+    function refreshStage() {
+        const n = screenTiles.size;
+        screensGrid.dataset.count = String(n);
+        screensGrid.classList.toggle('hidden', n === 0);
+        videoPlaceholder.classList.toggle('hidden', n > 0);
+    }
+
+    function addScreenTile(id, stream) {
+        let t = screenTiles.get(id);
+        if (t) {
+            if (t.stream !== stream) {
+                t.stream = stream;
+                t.video.srcObject = stream;
+                if (t.popupVideo && t.popup && !t.popup.closed) t.popupVideo.srcObject = stream;
+            }
+            return;
+        }
+        const el = document.createElement('div');
+        el.className = 'screen-tile relative min-h-0 min-w-0 bg-black rounded-2xl border border-slate-800 overflow-hidden shadow-2xl';
+
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = id === 'self'; // evita eco do próprio áudio
+        video.className = 'w-full h-full object-contain';
+        video.srcObject = stream;
+        video.addEventListener('click', () => video.play().catch(() => {}));
+
+        const label = document.createElement('div');
+        label.className = 'absolute top-3 left-3 max-w-[60%] bg-slate-900/90 border border-slate-700/80 px-3 py-1.5 rounded-xl flex items-center gap-2 text-xs font-medium text-slate-200 shadow-lg backdrop-blur';
+        label.innerHTML = '<i class="fa-solid fa-circle text-[8px] text-rose-500 animate-pulse motion-reduce:animate-none shrink-0" aria-hidden="true"></i><span class="truncate"></span>';
+
+        const actions = document.createElement('div');
+        actions.className = 'absolute top-3 right-3 flex gap-2';
+        actions.append(
+            tileButton('fa-up-right-from-square', 'Abrir em nova guia', () => openScreenTab(id)),
+            tileButton('fa-expand', 'Tela cheia', () => {
+                if (document.fullscreenElement) document.exitFullscreen();
+                else el.requestFullscreen?.().catch(console.error);
+            })
+        );
+
+        el.append(video, label, actions);
+        screensGrid.appendChild(el);
+        t = { el, video, label, stream, popup: null, popupVideo: null };
+        screenTiles.set(id, t);
+        refreshTileLabel(id);
+        refreshStage();
+        video.play().catch(() => showToast('Toque no vídeo para ativar o áudio da transmissão.'));
+    }
+
+    function refreshTileLabel(id) {
+        const t = screenTiles.get(id);
+        if (t) t.label.querySelector('span').textContent = tileTitle(id);
+    }
+
+    function removeScreenTile(id) {
+        const t = screenTiles.get(id);
+        if (!t) return;
+        screenTiles.delete(id);
+        try { if (t.popup && !t.popup.closed) t.popup.close(); } catch (_) {}
+        t.video.srcObject = null;
+        t.el.remove();
+        refreshStage();
+    }
+
+    // Abre a tela escolhida em uma guia separada (usa o mesmo stream, sem nova conexão)
+    function openScreenTab(id) {
+        const t = screenTiles.get(id);
+        if (!t) return;
+        if (t.popup && !t.popup.closed) { t.popup.focus(); return; }
+        const w = window.open('', '_blank');
+        if (!w) { showToast('O navegador bloqueou a nova guia. Permita pop-ups para este site.'); return; }
+        const d = w.document;
+        d.title = `${tileTitle(id)} - Sala ${roomId}`;
+        d.body.style.cssText = 'margin:0;background:#000;height:100vh;display:flex;align-items:center;justify-content:center;';
+        const v = d.createElement('video');
+        v.autoplay = true;
+        v.playsInline = true;
+        v.controls = true;
+        v.muted = id === 'self';
+        v.style.cssText = 'max-width:100%;max-height:100%;';
+        v.srcObject = t.stream;
+        d.body.appendChild(v);
+        v.play().catch(() => {});
+        t.popup = w;
+        t.popupVideo = v;
+        t.video.muted = true; // o áudio passa a tocar só na guia separada
+    }
+
+    // Detecta guia fechada pelo usuário e devolve o áudio ao painel principal
+    setInterval(() => {
+        screenTiles.forEach((t, id) => {
+            if (t.popup && t.popup.closed) {
+                t.popup = null;
+                t.popupVideo = null;
+                t.video.muted = id === 'self';
+            }
+        });
+    }, 1000);
 
     shareScreenBtn.addEventListener('click', async () => {
         if (isSharing) { stopScreenSharing(); return; }
-        if (presenterId && presenterId !== 'self') {
-            showToast('Outra pessoa já está transmitindo a tela.');
-            return;
-        }
         try {
             localDisplayStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: true });
         } catch (err) {
@@ -802,14 +896,7 @@
             return;
         }
         isSharing = true;
-        presenterId = 'self';
-        sharedVideo.muted = true; // evita eco do próprio áudio
-        sharedVideo.srcObject = localDisplayStream;
-        sharedVideo.classList.remove('hidden');
-        videoPlaceholder.classList.add('hidden');
-        fullscreenBtn.classList.remove('hidden');
-        presenterName.textContent = 'Você está transmitindo';
-        presenterBadge.classList.remove('hidden');
+        addScreenTile('self', localDisplayStream);
         shareBtnText.textContent = 'Parar Compartilhamento';
         shareScreenBtn.className = 'btn btn-rose';
 
@@ -822,24 +909,24 @@
     function stopScreenSharing() {
         if (!isSharing) return;
         isSharing = false;
-        const calls = [...screenCalls.values()];
-        screenCalls.clear();
+        const calls = [...screenOut.values()];
+        screenOut.clear();
         calls.forEach(c => c.close());
         localDisplayStream?.getTracks().forEach(t => t.stop());
         localDisplayStream = null;
-        clearStage();
+        removeScreenTile('self');
         shareBtnText.textContent = 'Compartilhar Tela';
         shareScreenBtn.className = 'btn btn-indigo';
         broadcastData({ type: 'screen-state', active: false });
         appendSystemMsg('Você encerrou o compartilhamento de tela.');
     }
 
-    fullscreenBtn.addEventListener('click', () => {
-        if (document.fullscreenElement) document.exitFullscreen();
-        else stageContainer.requestFullscreen?.().catch(console.error);
-    });
     document.addEventListener('fullscreenchange', () => {
-        fullscreenIcon.className = 'fa-solid text-sm ' + (document.fullscreenElement ? 'fa-compress' : 'fa-expand');
+        const fs = !!document.fullscreenElement;
+        screenTiles.forEach(t => {
+            const i = t.el.querySelector('.fa-expand, .fa-compress');
+            if (i) i.className = 'fa-solid text-sm ' + (t.el === document.fullscreenElement ? 'fa-compress' : 'fa-expand');
+        });
     });
 
     // ============================================================
@@ -888,6 +975,7 @@
         addParticipantItem('self', myUsername, true, isHost, micOn);
         peerConnections.forEach((info, id) => addParticipantItem(id, info.username, false, info.isHost, info.micActive));
         peerCountBadge.textContent = peerConnections.size + 1;
+        screenTiles.forEach((_, id) => refreshTileLabel(id)); // nomes podem ter mudado após o handshake
     }
 
     function addParticipantItem(id, name, isMe, isRoomHost, micActive) {
@@ -940,10 +1028,12 @@
     function destroyAll() {
         try { localDisplayStream?.getTracks().forEach(t => t.stop()); } catch (_) {}
         try { localAudioStream?.getTracks().forEach(t => t.stop()); } catch (_) {}
+        [...screenTiles.keys()].forEach(removeScreenTile); // também fecha guias separadas
         voiceCalls.forEach(c => c.close());
-        screenCalls.forEach(c => c.close());
+        screenIn.forEach(c => c.close());
+        screenOut.forEach(c => c.close());
         peerConnections.forEach(i => { try { i.conn.close(); } catch (_) {} });
-        voiceCalls.clear(); screenCalls.clear(); peerConnections.clear(); speakers.clear();
+        voiceCalls.clear(); screenIn.clear(); screenOut.clear(); peerConnections.clear(); speakers.clear();
         try { peer?.destroy(); } catch (_) {}
         try { registry?.destroy(); } catch (_) {}
         peer = registry = localAudioStream = localDisplayStream = null;
