@@ -249,6 +249,9 @@
     const watching = new Set();        // ids que estou assistindo
     const speakers = new Map();        // id -> { an, buf, on }
     const chatHistory = [];
+    const volumes = new Map();   // 'voice:<id>' | 'screen:<id>' -> 0..200 (100 = normal)
+    const gains = new Map();     // mesma chave -> { src, gain } (WebAudio)
+    let draggingVol = false, pendingList = false;
 
     // ============================================================
     // DOM
@@ -722,10 +725,11 @@
                     shares.set(conn.peer, true);
                     appendSystemMsg(`${info.username} iniciou compartilhamento de tela.`);
                     showToast(`${info.username} está transmitindo a tela.`);
-                    refreshStage();
+                    updateParticipantsList();
                 } else {
                     dropShare(conn.peer);
                     appendSystemMsg(`${info.username} encerrou a transmissão.`);
+                    updateParticipantsList();
                 }
                 break;
             case 'screen-watch':
@@ -788,6 +792,80 @@
         call.on('error', ended);
     }
 
+    // ---- Volume individual (0-200%, 100 = normal) via WebAudio ----
+    const getVol = (key) => volumes.get(key) ?? 100;
+
+    function attachGain(key, stream) {
+        detachGain(key);
+        if (!audioCtx || !stream.getAudioTracks().length) return false;
+        try {
+            audioCtx.resume();
+            const src = audioCtx.createMediaStreamSource(stream);
+            const gain = audioCtx.createGain();
+            gain.gain.value = getVol(key) / 100;
+            src.connect(gain);
+            gain.connect(audioCtx.destination);
+            gains.set(key, { src, gain });
+            return true;
+        } catch (err) { console.warn('WebAudio indisponível:', err); return false; }
+    }
+
+    function detachGain(key) {
+        const g = gains.get(key);
+        if (!g) return;
+        try { g.src.disconnect(); g.gain.disconnect(); } catch (_) {}
+        gains.delete(key);
+    }
+
+    function setVol(key, pct) {
+        pct = Math.max(0, Math.min(200, Math.round(Number(pct) || 0)));
+        volumes.set(key, pct);
+        const g = gains.get(key);
+        if (g) g.gain.gain.setTargetAtTime(pct / 100, audioCtx.currentTime, 0.015);
+        else if (key.startsWith('voice:')) { // fallback sem WebAudio (máx. 100%)
+            const el = document.getElementById(`audio-${key.slice(6)}`);
+            if (el) el.volume = Math.min(1, pct / 100);
+        }
+        document.querySelectorAll('input[data-vol]').forEach(i => { if (i.dataset.vol === key) i.value = pct; });
+        document.querySelectorAll('span[data-vol-label]').forEach(l => { if (l.dataset.volLabel === key) l.textContent = pct + '%'; });
+        if (key.startsWith('screen:')) {
+            const t = screenTiles.get(key.slice(7));
+            if (t?.popupVol && t.popup && !t.popup.closed) { t.popupVol.r.value = pct; t.popupVol.pct.textContent = pct + '%'; }
+        }
+    }
+
+    function makeVolume(key, label, wrapCls) {
+        const wrap = document.createElement('div');
+        wrap.className = wrapCls;
+        const name = document.createElement('span');
+        name.className = 'shrink-0 min-w-[2rem] text-slate-400';
+        name.textContent = label;
+        const input = document.createElement('input');
+        input.type = 'range'; input.min = '0'; input.max = '200'; input.step = '1';
+        input.value = String(getVol(key));
+        input.dataset.vol = key;
+        input.className = 'flex-1 min-w-0 h-1 accent-indigo-500 cursor-pointer';
+        input.setAttribute('aria-label', `Volume: ${label}`);
+        input.title = 'Duplo clique para voltar a 100%';
+        const pct = document.createElement('span');
+        pct.className = 'w-10 shrink-0 text-right tabular-nums text-slate-300';
+        pct.dataset.volLabel = key;
+        pct.textContent = getVol(key) + '%';
+        input.addEventListener('input', () => setVol(key, input.value));
+        input.addEventListener('dblclick', () => setVol(key, 100));
+        wrap.append(name, input, pct);
+        return wrap;
+    }
+
+    document.addEventListener('pointerdown', (e) => { if (e.target?.matches?.('input[data-vol]')) draggingVol = true; });
+    const endVolDrag = () => {
+        draggingVol = false;
+        if (pendingList) updateParticipantsList();
+    };
+    document.addEventListener('pointerup', endVolDrag);
+    document.addEventListener('pointercancel', endVolDrag);
+    participantsList.addEventListener('focusout', () => { if (pendingList && !draggingVol) setTimeout(updateParticipantsList, 0); });
+
     function playRemoteAudio(peerId, stream) {
         let el = document.getElementById(`audio-${peerId}`);
         if (!el) {
@@ -797,11 +875,14 @@
             el.playsInline = true;
             audioContainer.appendChild(el);
         }
-        el.srcObject = stream;
+        el.srcObject = stream; // o elemento mantém o stream ativo; o som sai pelo ganho do WebAudio
+        if (attachGain(`voice:${peerId}`, stream)) el.muted = true;
+        else { el.muted = false; el.volume = Math.min(1, getVol(`voice:${peerId}`) / 100); }
         el.play().catch(() => {});
     }
 
     function removeAudio(peerId) {
+        detachGain(`voice:${peerId}`);
         const el = document.getElementById(`audio-${peerId}`);
         if (el) { el.srcObject = null; el.remove(); }
     }
@@ -998,6 +1079,7 @@
         if (t) {
             if (t.stream !== stream) {
                 t.stream = stream;
+            if (id !== 'self') attachGain(`screen:${id}`, stream);
                 if (t.popup && !t.popup.closed) t.popupVideo.srcObject = stream;
                 else t.video.srcObject = stream;
             }
@@ -1009,7 +1091,7 @@
         const video = document.createElement('video');
         video.autoplay = true;
         video.playsInline = true;
-        video.muted = id === 'self'; // evita eco do próprio áudio
+        video.muted = true; // o áudio sai pelo controle de volume (WebAudio)
         video.className = 'w-full h-full object-contain';
         video.srcObject = stream;
         video.addEventListener('click', () => video.play().catch(() => {}));
@@ -1030,9 +1112,14 @@
         );
 
         el.append(video, label, actions);
+        if (id !== 'self') {
+            el.append(makeVolume(`screen:${id}`, 'Volume',
+                'absolute bottom-3 right-3 w-48 max-w-[70%] flex items-center gap-2 bg-slate-900/90 border border-slate-700/80 px-3 py-2 rounded-xl text-[11px] shadow-lg backdrop-blur'));
+        }
         screensGrid.appendChild(el);
         t = { el, video, label, stream, popup: null, popupVideo: null };
         screenTiles.set(id, t);
+        if (id !== 'self') attachGain(`screen:${id}`, stream);
         refreshTileLabel(id);
         refreshStage();
         video.play().catch(() => showToast('Toque no vídeo para ativar o áudio da transmissão.'));
@@ -1047,6 +1134,7 @@
         const t = screenTiles.get(id);
         if (t) {
             screenTiles.delete(id);
+            detachGain(`screen:${id}`);
             try { if (t.popup && !t.popup.closed) t.popup.close(); } catch (_) {}
             t.video.srcObject = null;
             t.el.remove();
@@ -1068,13 +1156,28 @@
         v.autoplay = true;
         v.playsInline = true;
         v.controls = true;
-        v.muted = id === 'self';
+        v.muted = true; // o áudio toca pelo controle de volume da página principal
         v.style.cssText = 'max-width:100%;max-height:100%;';
         v.srcObject = t.stream;
         d.body.appendChild(v);
+        let popupVol = null;
+        if (id !== 'self') {
+            const key = `screen:${id}`;
+            const bar = d.createElement('div');
+            bar.style.cssText = 'position:fixed;top:16px;right:16px;display:flex;align-items:center;gap:8px;background:rgba(15,23,42,.9);color:#e2e8f0;font:12px sans-serif;padding:8px 12px;border-radius:12px;z-index:10;';
+            const lab = d.createElement('span'); lab.textContent = 'Volume';
+            const r = d.createElement('input'); r.type = 'range'; r.min = '0'; r.max = '200'; r.value = String(getVol(key)); r.style.width = '120px';
+            const pct = d.createElement('span'); pct.textContent = getVol(key) + '%'; pct.style.minWidth = '38px';
+            r.addEventListener('input', () => setVol(key, r.value));
+            r.addEventListener('dblclick', () => setVol(key, 100));
+            bar.append(lab, r, pct);
+            d.body.appendChild(bar);
+            popupVol = { r, pct };
+        }
         v.play().catch(() => {});
         t.popup = w;
         t.popupVideo = v;
+        t.popupVol = popupVol;
         t.video.srcObject = null; // para de renderizar na principal
         t.el.remove();            // sai da grade (as demais telas ocupam o espaço)
         refreshStage();
@@ -1087,7 +1190,8 @@
         try { if (!t.popup.closed) t.popup.close(); } catch (_) {}
         t.popup = null;
         t.popupVideo = null;
-        t.video.muted = id === 'self';
+        t.popupVol = null;
+        t.video.muted = true;
         t.video.srcObject = t.stream;
         screensGrid.appendChild(t.el);
         t.video.play().catch(() => {});
@@ -1186,28 +1290,38 @@
     // PARTICIPANTES
     // ============================================================
     function updateParticipantsList() {
-        participantsList.innerHTML = '';
-        addParticipantItem('self', myUsername, true, isHost, micOn);
-        peerConnections.forEach((info, id) => addParticipantItem(id, info.username, false, info.isHost, info.micActive));
         peerCountBadge.textContent = peerConnections.size + 1;
         screenTiles.forEach((_, id) => refreshTileLabel(id)); // nomes podem ter mudado após o handshake
         refreshStage();
+        // não reconstrói a lista enquanto um slider está sendo arrastado
+        const a = document.activeElement;
+        if (draggingVol || (a && participantsList.contains(a) && a.matches?.('input[type=range]'))) { pendingList = true; return; }
+        pendingList = false;
+        participantsList.innerHTML = '';
+        addParticipantItem('self', myUsername, true, isHost, micOn);
+        peerConnections.forEach((info, id) => addParticipantItem(id, info.username, false, info.isHost, info.micActive));
     }
 
     function addParticipantItem(id, name, isMe, isRoomHost, micActive) {
         const item = document.createElement('div');
-        item.className = 'flex items-center justify-between p-2.5 bg-slate-950 border border-slate-800/80 rounded-xl text-xs';
+        item.className = 'p-2.5 bg-slate-950 border border-slate-800/80 rounded-xl text-xs space-y-2';
         item.innerHTML = `
-            <div class="flex items-center gap-2.5 min-w-0">
-                <div data-pid="${escapeHtml(id)}" class="shrink-0 w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 font-bold text-xs ${speakers.get(id)?.on ? 'mic-wave' : ''}">
-                    ${escapeHtml(name.charAt(0).toUpperCase())}
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2.5 min-w-0">
+                    <div data-pid="${escapeHtml(id)}" class="shrink-0 w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 font-bold text-xs ${speakers.get(id)?.on ? 'mic-wave' : ''}">
+                        ${escapeHtml(name.charAt(0).toUpperCase())}
+                    </div>
+                    <span class="font-medium text-slate-200 truncate">${escapeHtml(name)} ${isMe ? '<span class="text-slate-500">(Você)</span>' : ''}</span>
                 </div>
-                <span class="font-medium text-slate-200 truncate">${escapeHtml(name)} ${isMe ? '<span class="text-slate-500">(Você)</span>' : ''}</span>
-            </div>
-            <div class="flex items-center gap-2 shrink-0">
-                <i class="fa-solid ${micActive ? 'fa-microphone text-emerald-400' : 'fa-microphone-slash text-rose-400'} text-xs" aria-label="${micActive ? 'Microfone ligado' : 'Microfone desligado'}"></i>
-                ${isRoomHost ? '<span class="text-[10px] bg-indigo-950 text-indigo-400 px-2 py-0.5 rounded-md border border-indigo-800/50">Host</span>' : ''}
+                <div class="flex items-center gap-2 shrink-0">
+                    <i class="fa-solid ${micActive ? 'fa-microphone text-emerald-400' : 'fa-microphone-slash text-rose-400'} text-xs" aria-label="${micActive ? 'Microfone ligado' : 'Microfone desligado'}"></i>
+                    ${isRoomHost ? '<span class="text-[10px] bg-indigo-950 text-indigo-400 px-2 py-0.5 rounded-md border border-indigo-800/50">Host</span>' : ''}
+                </div>
             </div>`;
+        if (!isMe) {
+            item.append(makeVolume(`voice:${id}`, 'Voz', 'flex items-center gap-2 text-[11px]'));
+            if (shares.has(id)) item.append(makeVolume(`screen:${id}`, 'Tela', 'flex items-center gap-2 text-[11px]'));
+        }
         participantsList.appendChild(item);
     }
 
@@ -1252,6 +1366,7 @@
         peerConnections.forEach(i => { try { i.conn.close(); } catch (_) {} });
         voiceCalls.clear(); screenIn.clear(); screenOut.clear(); peerConnections.clear(); speakers.clear();
         shares.clear(); watching.clear();
+        [...gains.keys()].forEach(detachGain); volumes.clear();
         try { peer?.destroy(); } catch (_) {}
         try { registry?.destroy(); } catch (_) {}
         peer = registry = localAudioStream = localDisplayStream = null;
