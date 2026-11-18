@@ -9,11 +9,10 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap">
-    <!-- Versão fixa. Para SRI, gere o hash e adicione integrity="sha384-..." crossorigin="anonymous" -->
     <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <style type="text/tailwindcss">
         body { font-family: 'Plus Jakarta Sans', sans-serif; }
-        .scrollbar-custom::-webkit-scrollbar { width: 5px; }
+        .scrollbar-custom::-webkit-scrollbar { width: 5px; height: 5px; }
         .scrollbar-custom::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); }
         .scrollbar-custom::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); border-radius: 4px; }
         .scrollbar-custom::-webkit-scrollbar-thumb:hover { background: rgba(99, 102, 241, 0.8); }
@@ -28,8 +27,10 @@
         .tab { @apply px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 text-slate-400 hover:text-slate-200; }
         .tab-active { @apply bg-indigo-600 text-white hover:text-white; }
 
-        /* Grade de telas compartilhadas (1 a 6 simultâneas) */
-        .screens-grid { display: grid; gap: .75rem; width: 100%; height: 100%; grid-template-columns: 1fr; grid-auto-rows: minmax(0, 1fr); }
+        /* Grade de telas que estou assistindo (1 a 6 simultâneas) */
+        .screens-grid { position: absolute; inset: .75rem; display: grid; gap: .75rem; grid-template-columns: 1fr; grid-auto-rows: minmax(0, 1fr); }
+        .screens-grid.hidden { display: none; }
+        @media (min-width: 640px) { .screens-grid { inset: 1.5rem; } }
         .screens-grid[data-count="3"], .screens-grid[data-count="4"],
         .screens-grid[data-count="5"], .screens-grid[data-count="6"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .screens-grid[data-count="3"] .screen-tile:last-child { grid-column: span 2; }
@@ -118,14 +119,17 @@
                 </div>
             </div>
 
+            <!-- Barra de transmissões disponíveis -->
+            <div id="shares-bar" class="hidden shrink-0 px-3 sm:px-6 py-2 border-b border-slate-800/80 bg-slate-900/40 flex items-center gap-2 overflow-x-auto scrollbar-custom"></div>
+
             <div id="stage-container" class="flex-1 relative flex items-center justify-center p-3 sm:p-6 bg-slate-950/90 overflow-hidden min-h-0">
                 <div id="video-placeholder" class="text-center space-y-4 max-w-md p-6 sm:p-8 border border-slate-800/60 rounded-3xl bg-slate-900/40 backdrop-blur-sm shadow-2xl">
                     <div class="w-16 h-16 sm:w-20 sm:h-20 mx-auto rounded-2xl bg-indigo-950/50 border border-indigo-800/40 flex items-center justify-center text-indigo-400">
                         <i class="fa-solid fa-desktop text-2xl sm:text-3xl" aria-hidden="true"></i>
                     </div>
                     <div class="space-y-1.5">
-                        <h3 class="text-base font-semibold text-slate-200">Nenhum compartilhamento de tela ativo</h3>
-                        <p class="text-xs text-slate-400 leading-relaxed">O áudio por voz está ativo. Qualquer pessoa pode compartilhar a tela e várias telas podem ser exibidas ao mesmo tempo.</p>
+                        <h3 id="placeholder-title" class="text-base font-semibold text-slate-200">Nenhum compartilhamento de tela ativo</h3>
+                        <p id="placeholder-desc" class="text-xs text-slate-400 leading-relaxed">O áudio por voz está ativo. Qualquer pessoa pode compartilhar a tela e você escolhe qual assistir.</p>
                     </div>
                 </div>
 
@@ -239,7 +243,9 @@
     const voiceCalls = new Map();      // peerId -> MediaConnection (voz)
     const screenIn = new Map();        // peerId -> MediaConnection (tela que RECEBO deste participante)
     const screenOut = new Map();       // peerId -> MediaConnection (minha tela que ENVIO a este participante)
-    const screenTiles = new Map();     // 'self' | peerId -> { el, video, label, stream, popup }
+    const screenTiles = new Map();     // 'self' | peerId -> { el, video, label, stream, popup, popupVideo }
+    const shares = new Map();          // id ('self' | peerId) -> true: transmissões disponíveis
+    const watching = new Set();        // ids que estou assistindo
     const speakers = new Map();        // id -> { an, buf, on }
     const chatHistory = [];
 
@@ -253,6 +259,7 @@
     const appContainer = $('app-container'), currentRoomLabel = $('current-room-label'), roleBadge = $('role-badge');
     const statusPill = $('connection-status-pill'), statusDot = $('status-dot'), statusPing = $('status-ping');
     const videoPlaceholder = $('video-placeholder'), screensGrid = $('screens-grid');
+    const sharesBar = $('shares-bar'), placeholderTitle = $('placeholder-title'), placeholderDesc = $('placeholder-desc');
     const toggleMicBtn = $('toggle-mic-btn'), micIcon = $('mic-icon'), micBtnText = $('mic-btn-text');
     const shareScreenBtn = $('share-screen-btn'), shareBtnText = $('share-btn-text');
     const copyLinkBtn = $('copy-link-btn'), leaveBtn = $('leave-btn');
@@ -411,6 +418,7 @@
             });
             peer.on('call', (call) => {
                 if (call.metadata?.kind === 'screen') {
+                    if (!watching.has(call.peer)) { call.close(); return; } // não pedi essa tela
                     call.answer(); // só recebe; não devolve mídia
                     bindMediaCall(call, 'screen-in');
                 } else {
@@ -561,7 +569,7 @@
 
             // Apenas quem iniciou a conexão liga para a voz (evita chamadas duplicadas)
             if (outgoing) bindMediaCall(peer.call(conn.peer, outgoingAudio(), { metadata: { kind: 'voice' } }), 'voice');
-            if (isSharing) callScreen(conn.peer);
+            // A tela NÃO é enviada automaticamente: só quando o outro pedir (screen-watch)
             updateParticipantsList();
         });
 
@@ -577,11 +585,10 @@
         peerConnections.delete(id);
         try { info.conn.close(); } catch (_) {}
         const vc = voiceCalls.get(id); voiceCalls.delete(id); vc?.close();
-        const si = screenIn.get(id); screenIn.delete(id); si?.close();
         const so = screenOut.get(id); screenOut.delete(id); so?.close();
         removeAudio(id);
         unwatch(id);
-        removeScreenTile(id);
+        dropShare(id);
         if (info.greeted) {
             appendSystemMsg(`${info.username} saiu da sala.`);
             showToast(`${info.username} saiu.`);
@@ -599,6 +606,8 @@
                 info.username = uniqueName(clean(data.username, 30) || 'Participante', conn.peer);
                 info.micActive = data.micActive !== false;
                 info.isHost = data.isHost === true;
+                if (data.sharing === true) shares.set(conn.peer, true); else dropShare(conn.peer);
+                refreshStage();
                 if (!info.greeted) {
                     info.greeted = true;
                     appendSystemMsg(`${info.username} entrou na sala.`);
@@ -623,11 +632,19 @@
                 break;
             case 'screen-state':
                 if (data.active === true) {
+                    shares.set(conn.peer, true);
                     appendSystemMsg(`${info.username} iniciou compartilhamento de tela.`);
+                    showToast(`${info.username} está transmitindo a tela.`);
+                    refreshStage();
                 } else {
+                    dropShare(conn.peer);
                     appendSystemMsg(`${info.username} encerrou a transmissão.`);
-                    removeScreenTile(conn.peer);
                 }
+                break;
+            case 'screen-watch':
+                if (!isSharing) break;
+                if (data.want === true) callScreen(conn.peer);
+                else { const c = screenOut.get(conn.peer); screenOut.delete(conn.peer); c?.close(); }
                 break;
             case 'host-changed':
                 peerConnections.forEach(p => { p.isHost = false; });
@@ -662,8 +679,6 @@
     // ============================================================
     // CHAMADAS DE MÍDIA (VOZ E TELA)
     // kind: 'voice' | 'screen-in' (recebo) | 'screen-out' (envio)
-    // Telas usam mapas separados para vários participantes poderem
-    // compartilhar ao mesmo tempo sem uma chamada sobrescrever a outra.
     // ============================================================
     function bindMediaCall(call, kind) {
         if (!call) return;
@@ -679,7 +694,7 @@
         const ended = () => {
             if (map.get(call.peer) !== call) return; // foi substituída
             map.delete(call.peer);
-            if (kind === 'screen-in') removeScreenTile(call.peer);
+            if (kind === 'screen-in') { watching.delete(call.peer); removeScreenTile(call.peer); }
             else if (kind === 'voice') { removeAudio(call.peer); unwatch(call.peer); }
         };
         call.on('close', ended);
@@ -762,16 +777,25 @@
     }, 150);
 
     // ============================================================
-    // COMPARTILHAMENTO DE TELA (VÁRIOS AO MESMO TEMPO)
+    // COMPARTILHAMENTO DE TELA (ESTILO DISCORD)
+    // Quem compartilha só avisa. Quem quer ver clica em "Assistir"
+    // e só então a chamada de vídeo é aberta. Cada transmissão é isolada.
     // ============================================================
+    function sendTo(id, data) {
+        const i = peerConnections.get(id);
+        if (i?.conn.open) i.conn.send(data);
+    }
+
     function callScreen(id) {
         if (!localDisplayStream || !peer) return;
         bindMediaCall(peer.call(id, localDisplayStream, { metadata: { kind: 'screen' } }), 'screen-out');
     }
 
+    function shareName(id) {
+        return id === 'self' ? 'Sua tela' : (peerConnections.get(id)?.username || 'Participante');
+    }
     function tileTitle(id) {
-        if (id === 'self') return 'Você está transmitindo';
-        return `${peerConnections.get(id)?.username || 'Participante'} está transmitindo`;
+        return id === 'self' ? 'Você está transmitindo' : `${shareName(id)} está transmitindo`;
     }
 
     function tileButton(icon, label, onClick) {
@@ -785,11 +809,101 @@
         return b;
     }
 
+    function chipButton(text, cls, onClick) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-all active:scale-95 ' + cls;
+        b.textContent = text;
+        b.addEventListener('click', onClick);
+        return b;
+    }
+
+    // ---- Escolher o que assistir ----
+    function watchShare(id) {
+        if (watching.has(id)) return;
+        if (id === 'self') {
+            if (!localDisplayStream) return;
+            watching.add(id);
+            addScreenTile('self', localDisplayStream);
+        } else {
+            if (!shares.has(id)) return;
+            watching.add(id);
+            sendTo(id, { type: 'screen-watch', want: true }); // o transmissor só então me envia o vídeo
+        }
+        refreshStage();
+    }
+
+    function unwatchShare(id) {
+        if (!watching.delete(id)) return;
+        if (id !== 'self') {
+            sendTo(id, { type: 'screen-watch', want: false });
+            const c = screenIn.get(id); screenIn.delete(id); c?.close();
+        }
+        removeScreenTile(id);
+    }
+
+    function dropShare(id) { // a transmissão acabou / a pessoa saiu
+        shares.delete(id);
+        watching.delete(id);
+        const c = screenIn.get(id); screenIn.delete(id); c?.close();
+        removeScreenTile(id);
+    }
+
+    // ---- Palco: grade principal + barra de transmissões ----
     function refreshStage() {
-        const n = screenTiles.size;
-        screensGrid.dataset.count = String(n);
-        screensGrid.classList.toggle('hidden', n === 0);
-        videoPlaceholder.classList.toggle('hidden', n > 0);
+        let inMain = 0;
+        screenTiles.forEach(t => { if (!t.popup) inMain++; });
+        screensGrid.dataset.count = String(inMain);
+        screensGrid.classList.toggle('hidden', inMain === 0);
+        videoPlaceholder.classList.toggle('hidden', inMain > 0);
+
+        if (screenTiles.size > 0) {
+            placeholderTitle.textContent = 'Transmissões abertas em outra janela';
+            placeholderDesc.textContent = 'Use "Trazer de volta" na barra acima para exibir aqui novamente.';
+        } else if (shares.size > 0) {
+            placeholderTitle.textContent = 'Escolha uma tela para assistir';
+            placeholderDesc.textContent = 'Clique em "Assistir" na barra acima.';
+        } else {
+            placeholderTitle.textContent = 'Nenhum compartilhamento de tela ativo';
+            placeholderDesc.textContent = 'O áudio por voz está ativo. Qualquer pessoa pode compartilhar a tela e você escolhe qual assistir.';
+        }
+
+        sharesBar.replaceChildren();
+        sharesBar.classList.toggle('hidden', shares.size === 0);
+        shares.forEach((_, id) => {
+            const t = screenTiles.get(id);
+            const popped = !!t?.popup;
+            const on = watching.has(id);
+            const isSelf = id === 'self';
+
+            const chip = document.createElement('div');
+            chip.className = 'shrink-0 flex items-center gap-2 pl-3 pr-1.5 py-1 rounded-xl border text-xs font-medium ' +
+                (on ? 'bg-indigo-950/70 border-indigo-700/60 text-indigo-200' : 'bg-slate-900 border-slate-700/80 text-slate-300');
+
+            const dot = document.createElement('i');
+            dot.className = 'fa-solid fa-circle text-[7px] text-rose-500';
+            dot.setAttribute('aria-hidden', 'true');
+            const name = document.createElement('span');
+            name.className = 'max-w-[140px] truncate';
+            name.textContent = shareName(id);
+            chip.append(dot, name);
+
+            if (on && !t) {
+                const s = document.createElement('span');
+                s.className = 'text-[10px] text-slate-400';
+                s.textContent = 'conectando...';
+                chip.append(s);
+            }
+            if (popped) {
+                chip.append(chipButton('Trazer de volta', 'bg-slate-800 hover:bg-slate-700 text-slate-200', () => returnToMain(id)));
+            }
+            if (on) {
+                chip.append(chipButton(isSelf ? 'Ocultar' : 'Parar', 'bg-slate-800 hover:bg-slate-700 text-slate-200', () => unwatchShare(id)));
+            } else {
+                chip.append(chipButton(isSelf ? 'Ver prévia' : 'Assistir', 'bg-indigo-600 hover:bg-indigo-500 text-white', () => watchShare(id)));
+            }
+            sharesBar.appendChild(chip);
+        });
     }
 
     function addScreenTile(id, stream) {
@@ -797,8 +911,8 @@
         if (t) {
             if (t.stream !== stream) {
                 t.stream = stream;
-                t.video.srcObject = stream;
-                if (t.popupVideo && t.popup && !t.popup.closed) t.popupVideo.srcObject = stream;
+                if (t.popup && !t.popup.closed) t.popupVideo.srcObject = stream;
+                else t.video.srcObject = stream;
             }
             return;
         }
@@ -814,7 +928,7 @@
         video.addEventListener('click', () => video.play().catch(() => {}));
 
         const label = document.createElement('div');
-        label.className = 'absolute top-3 left-3 max-w-[60%] bg-slate-900/90 border border-slate-700/80 px-3 py-1.5 rounded-xl flex items-center gap-2 text-xs font-medium text-slate-200 shadow-lg backdrop-blur';
+        label.className = 'absolute top-3 left-3 max-w-[50%] bg-slate-900/90 border border-slate-700/80 px-3 py-1.5 rounded-xl flex items-center gap-2 text-xs font-medium text-slate-200 shadow-lg backdrop-blur';
         label.innerHTML = '<i class="fa-solid fa-circle text-[8px] text-rose-500 animate-pulse motion-reduce:animate-none shrink-0" aria-hidden="true"></i><span class="truncate"></span>';
 
         const actions = document.createElement('div');
@@ -824,7 +938,8 @@
             tileButton('fa-expand', 'Tela cheia', () => {
                 if (document.fullscreenElement) document.exitFullscreen();
                 else el.requestFullscreen?.().catch(console.error);
-            })
+            }),
+            tileButton('fa-eye-slash', id === 'self' ? 'Ocultar prévia' : 'Parar de assistir', () => unwatchShare(id))
         );
 
         el.append(video, label, actions);
@@ -843,15 +958,16 @@
 
     function removeScreenTile(id) {
         const t = screenTiles.get(id);
-        if (!t) return;
-        screenTiles.delete(id);
-        try { if (t.popup && !t.popup.closed) t.popup.close(); } catch (_) {}
-        t.video.srcObject = null;
-        t.el.remove();
+        if (t) {
+            screenTiles.delete(id);
+            try { if (t.popup && !t.popup.closed) t.popup.close(); } catch (_) {}
+            t.video.srcObject = null;
+            t.el.remove();
+        }
         refreshStage();
     }
 
-    // Abre a tela escolhida em uma guia separada (usa o mesmo stream, sem nova conexão)
+    // Abre em outra guia e REMOVE da tela principal
     function openScreenTab(id) {
         const t = screenTiles.get(id);
         if (!t) return;
@@ -872,20 +988,30 @@
         v.play().catch(() => {});
         t.popup = w;
         t.popupVideo = v;
-        t.video.muted = true; // o áudio passa a tocar só na guia separada
+        t.video.srcObject = null; // para de renderizar na principal
+        t.el.remove();            // sai da grade (as demais telas ocupam o espaço)
+        refreshStage();
     }
 
-    // Detecta guia fechada pelo usuário e devolve o áudio ao painel principal
-    setInterval(() => {
-        screenTiles.forEach((t, id) => {
-            if (t.popup && t.popup.closed) {
-                t.popup = null;
-                t.popupVideo = null;
-                t.video.muted = id === 'self';
-            }
-        });
-    }, 1000);
+    // Fechou a guia (ou clicou em "Trazer de volta"): volta para a principal
+    function returnToMain(id) {
+        const t = screenTiles.get(id);
+        if (!t || !t.popup) return;
+        try { if (!t.popup.closed) t.popup.close(); } catch (_) {}
+        t.popup = null;
+        t.popupVideo = null;
+        t.video.muted = id === 'self';
+        t.video.srcObject = t.stream;
+        screensGrid.appendChild(t.el);
+        t.video.play().catch(() => {});
+        refreshStage();
+    }
 
+    setInterval(() => {
+        screenTiles.forEach((t, id) => { if (t.popup && t.popup.closed) returnToMain(id); });
+    }, 800);
+
+    // ---- Compartilhar a minha tela ----
     shareScreenBtn.addEventListener('click', async () => {
         if (isSharing) { stopScreenSharing(); return; }
         try {
@@ -896,12 +1022,13 @@
             return;
         }
         isSharing = true;
-        addScreenTile('self', localDisplayStream);
+        shares.set('self', true);
+        watching.add('self');
+        addScreenTile('self', localDisplayStream); // prévia local
         shareBtnText.textContent = 'Parar Compartilhamento';
         shareScreenBtn.className = 'btn btn-rose';
 
-        peerConnections.forEach((_, id) => callScreen(id));
-        broadcastData({ type: 'screen-state', active: true });
+        broadcastData({ type: 'screen-state', active: true }); // quem quiser assistir pede
         appendSystemMsg('Você iniciou o compartilhamento de tela.');
         localDisplayStream.getVideoTracks()[0].addEventListener('ended', stopScreenSharing);
     });
@@ -909,11 +1036,13 @@
     function stopScreenSharing() {
         if (!isSharing) return;
         isSharing = false;
-        const calls = [...screenOut.values()];
+        const calls = [...screenOut.values()]; // só as chamadas que EU enviei
         screenOut.clear();
         calls.forEach(c => c.close());
         localDisplayStream?.getTracks().forEach(t => t.stop());
         localDisplayStream = null;
+        shares.delete('self');
+        watching.delete('self');
         removeScreenTile('self');
         shareBtnText.textContent = 'Compartilhar Tela';
         shareScreenBtn.className = 'btn btn-indigo';
@@ -922,7 +1051,6 @@
     }
 
     document.addEventListener('fullscreenchange', () => {
-        const fs = !!document.fullscreenElement;
         screenTiles.forEach(t => {
             const i = t.el.querySelector('.fa-expand, .fa-compress');
             if (i) i.className = 'fa-solid text-sm ' + (t.el === document.fullscreenElement ? 'fa-compress' : 'fa-expand');
@@ -976,6 +1104,7 @@
         peerConnections.forEach((info, id) => addParticipantItem(id, info.username, false, info.isHost, info.micActive));
         peerCountBadge.textContent = peerConnections.size + 1;
         screenTiles.forEach((_, id) => refreshTileLabel(id)); // nomes podem ter mudado após o handshake
+        refreshStage();
     }
 
     function addParticipantItem(id, name, isMe, isRoomHost, micActive) {
@@ -1034,6 +1163,7 @@
         screenOut.forEach(c => c.close());
         peerConnections.forEach(i => { try { i.conn.close(); } catch (_) {} });
         voiceCalls.clear(); screenIn.clear(); screenOut.clear(); peerConnections.clear(); speakers.clear();
+        shares.clear(); watching.clear();
         try { peer?.destroy(); } catch (_) {}
         try { registry?.destroy(); } catch (_) {}
         peer = registry = localAudioStream = localDisplayStream = null;
